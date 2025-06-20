@@ -3118,6 +3118,11 @@ class MultiModalConfig:
     """
     If `True`, disable caching of the processed multi-modal inputs.
     """
+    
+    mm_preprocessor_cache_type: Literal["shm", "lru"] = "shm"
+    """Type of cache to use for the multi-modal preprocessor/mapper. If `shm`,
+    use shared memory for caching. If `lru`, use an LRU cache."""
+
 
     def compute_hash(self) -> str:
         """
