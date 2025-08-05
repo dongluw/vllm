@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pickle
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from multiprocessing.synchronize import Lock as LockType
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 
 import torch
@@ -14,7 +15,6 @@ import torch
 from vllm.config import MultiModalConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MultiModalKwargs
-from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 logger = init_logger(__name__)
@@ -110,7 +110,7 @@ class SingleWriterShmRingBuffer:
     def __init__(
         self,
         data_buffer_size: int,
-        is_free_fn: Optional[Callable] = lambda x: True,
+        is_free_fn: Callable = lambda x: True,
         name: Optional[str] = None,
         create: bool = False,
     ):
@@ -140,22 +140,16 @@ class SingleWriterShmRingBuffer:
                     "multiprocessing.resource_tracker.register",
                     lambda *args, **kwargs: None,
             ):
-                try:
-                    self.shared_memory = shared_memory.SharedMemory(name=name)
-                    # See https://docs.python.org/3/library/multiprocessing.shared_memory.html # noqa
-                    # Some platforms allocate memory based on page size,
-                    # so the shared memory block size may be larger or equal
-                    # to the requested size. The size parameter is ignored
-                    # when attaching to an existing block.
-                    assert self.shared_memory.size >= self.data_buffer_size
+                self.shared_memory = shared_memory.SharedMemory(name=name)
+                # See https://docs.python.org/3/library/multiprocessing.shared_memory.html # noqa
+                # Some platforms allocate memory based on page size,
+                # so the shared memory block size may be larger or equal
+                # to the requested size. The size parameter is ignored
+                # when attaching to an existing block.
+                assert self.shared_memory.size >= self.data_buffer_size
 
-                except FileNotFoundError:
-                    # we might deserialize the object in a different node
-                    # in this case, this object is not used,
-                    # and we should suppress the error
-                    pass
-        logger.info("Shared memory created/opened with name: %s, size: %d",
-                    self.shared_memory.name, self.data_buffer_size)
+        logger.debug("Shared memory created/opened with name: %s, size: %d",
+                     self.shared_memory.name, self.data_buffer_size)
 
     def handle(self):
         return (
@@ -197,7 +191,7 @@ class SingleWriterShmRingBuffer:
         occupied_size_new = buffer_end_reset + size - self.data_buffer_start
         if occupied_size_new > self.data_buffer_size:
             raise MemoryError("Not enough space in the data buffer, "
-                              "try calling try_free_buf() to free up space")
+                              "try calling free_buf() to free up space")
         self.data_buffer_end = buffer_end_reset
 
         # first 4 bytes as the monotonic id
@@ -233,15 +227,22 @@ class SingleWriterShmRingBuffer:
             yield data_view, (id, size)
 
     def free_buf(self, nbytes=None) -> tuple[int, int]:
-        # free the buffer by resetting the metadata
-        # this is a no-op in shared memory,
-        # but we need to keep track of the metadata
+        '''
+        Free a buffer of the given size. This is a no-op in shared memory,
+        but we need to keep track of the metadata.
+        
+        Args:
+            nbytes (int, optional): The size of the buffer to free. If None,
+            frees the maximum size of the ring buffer.
+        '''
+
         assert self.is_writer, "Only the writer can free buffers."
-        logger.info(
+        logger.debug(
             "Freeing up space in the ring buffer, "
             "monotonic_id_start: %d, monotonic_id_end: %d",
             self.monotonic_id_start, self.monotonic_id_end)
         monotonic_id_before = self.monotonic_id_start
+        # if nbytes is None, free up the maximum size of the ring buffer
         if nbytes is None:
             nbytes = self.data_buffer_size
         freed_bytes = 0
@@ -260,7 +261,7 @@ class SingleWriterShmRingBuffer:
                     # there are still readers, we cannot free the buffer
                     break
 
-        logger.info(
+        logger.debug(
             "Freed %d bytes from the ring buffer, "
             "monotonic_id_start: %d, monotonic_id_end: %d", freed_bytes,
             self.monotonic_id_start, self.monotonic_id_end)
@@ -274,11 +275,82 @@ class SingleWriterShmRingBuffer:
         return monotonic_id_before, monotonic_id_after
 
 
+class ObjectSerde(ABC):
+
+    @abstractmethod
+    def serialize(self, value: Any) -> tuple[Any, int, bytes, int]:
+        """Serialize an object to bytes."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def deserialize(self, data: memoryview) -> Any:
+        """Deserialize bytes back to an object."""
+        raise NotImplementedError
+
+
+class MsgpackSerde(ObjectSerde):
+
+    def __init__(self):
+        self.encoder = MsgpackEncoder()
+        self.tensor_decoder = MsgpackDecoder(torch.Tensor)
+        self.mm_decoder = MsgpackDecoder(MultiModalKwargs)
+
+    def serialize(
+            self,
+            value: Any) -> tuple[Union[bytes, list[bytes]], int, bytes, int]:
+        len_arr = None
+        if isinstance(value, (torch.Tensor, MultiModalKwargs)):
+            type_name = type(value).__name__
+            value = self.encoder.encode(value)
+            len_arr = [len(s) for s in value]
+            nbytes = sum(len_arr)
+        else:
+            value = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+            type_name = type(value).__name__
+            nbytes = len(value)
+
+        object_metadata = (type_name, nbytes, len_arr)
+        serialized_metadata = pickle.dumps(object_metadata,
+                                           protocol=pickle.HIGHEST_PROTOCOL)
+        return value, nbytes, serialized_metadata, len(serialized_metadata)
+
+    def deserialize(self, data_view: memoryview) -> Any:
+        # pickle.loads do not read past the end of a pickled object
+        # within a large buffer
+        type_name, nbytes, len_arr = pickle.loads(data_view)
+        serialized_data = bytearray(data_view[-nbytes:])
+
+        if type_name == torch.Tensor.__name__:
+            obj = []
+            start_idx = 0
+            for length in len_arr:
+                item_bytes = serialized_data[start_idx:start_idx + length]
+                obj.append(item_bytes)
+                start_idx += length
+            obj = self.tensor_decoder.decode(obj)
+        elif type_name == MultiModalKwargs.__name__:
+            obj = []
+            start_idx = 0
+            for length in len_arr:
+                item_bytes = serialized_data[start_idx:start_idx + length]
+                obj.append(item_bytes)
+                start_idx += length
+            obj = self.mm_decoder.decode(obj)
+        elif type_name == bytes.__name__:
+            obj = pickle.loads(serialized_data)
+        else:
+            raise ValueError(
+                f"Unsupported object type '{type_name}' in metadata")
+
+        return obj
+
+
 @dataclass
 class ShmObjectStorageHandle:
     max_object_size: int
     n_readers: int
     ring_buffer_handle: tuple[int, Callable, str]
+    serde_class: type[ObjectSerde]
     reader_lock: Optional[LockType]
 
 
@@ -300,15 +372,15 @@ class SingleWriterShmObjectStorage:
     - Thread-safe operations with reader synchronization via locks
     
     Key Features:
-    - **FIFO Eviction**: Oldest objects are evicted first when memory is full
-    - **Reference Counting**: Objects are only freed when no readers are
+    - FIFO Eviction: Oldest objects are evicted first when memory is full
+    - Reference Counting: Objects are only freed when no readers are
       accessing them
-    - **Duplicate Key Handling**: Existing keys are not overwritten, just
+    - Duplicate Key Handling: Existing keys are not overwritten, just
       re-referenced
-    - **Specialized Serialization**: Optimized handling for torch.Tensor and
-      MultiModalKwargs
-    - **Cross-Process Safety**: Uses shared memory with proper synchronization
-    - **Automatic Cleanup**: Garbage collection happens transparently during
+    - Customized Serialization: By default uses Msgpack for efficient
+      serialization of Python objects, but can be extended for custom types
+    - Cross-Process Safety: Uses shared memory with proper synchronization
+    - Automatic Cleanup: Garbage collection happens transparently during
       allocation
 
     Memory Layout per Object:
@@ -326,20 +398,29 @@ class SingleWriterShmObjectStorage:
         max_object_size: int,
         n_readers: int,
         ring_buffer: SingleWriterShmRingBuffer,
+        serde_class: type[ObjectSerde] = MsgpackSerde,
         reader_lock: Optional[LockType] = None,
     ):
         """
         Initialize the object storage.
 
         Args:
-            max_object_size: Maximum size for a single chunk
-            data_buffer_size: Total size of the ring buffer
-            name: Name for existing shared memory (None to create new)
+            max_object_size: Maximum size for a single object in bytes.
+            n_readers: Number of reader processes that can access the storage.
+            ring_buffer: The shared memory ring buffer for storing objects.
+            serde_class: Serializer/deserializer for objects.
+            reader_lock: Optional lock for synchronizing reader access.
+        Raises:
+            ValueError: If reader_lock is None for readers.
         """
-        self.ring_buffer = ring_buffer
-        self.is_writer = self.ring_buffer.is_writer
+
         self.max_object_size = max_object_size
         self.n_readers = n_readers
+        self.serde_class = serde_class
+        self.ser_de = serde_class()
+        self.ring_buffer = ring_buffer
+        self.is_writer = self.ring_buffer.is_writer
+
         self.flag_bytes = 4  # for in-use flag
 
         if self.is_writer:
@@ -352,9 +433,6 @@ class SingleWriterShmObjectStorage:
                 raise ValueError("Lock must be provided for readers.")
 
         self._reader_lock = reader_lock
-        self.encoder = MsgpackEncoder()
-        self.mm_decoder = MsgpackDecoder(MultiModalKwargs)
-        self.tensor_decoder = MsgpackDecoder(torch.Tensor)
 
     def clear(self) -> None:
         """Clear the object storage."""
@@ -362,48 +440,35 @@ class SingleWriterShmObjectStorage:
             self.ring_buffer.clear()
             self.key_index.clear()
             self.id_index.clear()
-            logger.info("Object storage cleared and reinitialized.")
-
-    def calcsize_serialize(self, value: Any) -> tuple[Any, int, bytes, int]:
-
-        len_arr = None
-        if isinstance(value, (torch.Tensor, MultiModalKwargs)):
-            type_name = type(value).__name__
-            value = self.encoder.encode(value)
-            len_arr = [len(s) for s in value]
-            nbytes = sum(len_arr)
-        else:
-            value = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-            type_name = type(value).__name__
-            nbytes = len(value)
-
-        object_metadata = (type_name, nbytes, len_arr)
-        serialized_metadata = pickle.dumps(object_metadata,
-                                           protocol=pickle.HIGHEST_PROTOCOL)
-        return value, nbytes, serialized_metadata, len(serialized_metadata)
+            logger.debug("Object storage cleared and reinitialized.")
 
     def copy_to_buffer(
         self,
-        data: Any,
+        data: Union[bytes, list[bytes]],
         data_bytes: int,
         metadata: bytes,
         md_bytes: int,
         data_view: memoryview,
     ) -> None:
+        data_view[self.flag_bytes:self.flag_bytes + md_bytes] = metadata
         if isinstance(data, bytes):
             data_view[-data_bytes:] = data
-            data_view[self.flag_bytes:self.flag_bytes + md_bytes] = metadata
         elif isinstance(data, list):
-            data_view[self.flag_bytes:self.flag_bytes + md_bytes] = metadata
             start_idx = self.flag_bytes + md_bytes
             for item_bytes in data:
                 item_size = len(item_bytes)
                 data_view[start_idx:start_idx + item_size] = item_bytes
                 start_idx += item_size
-
         else:
             raise ValueError(
                 f"Unsupported data type for serialization: {type(data)}")
+
+    def set_reader_flag(self, data_view: memoryview, value: int) -> None:
+        """Set the in-use flag for the reader."""
+        # >0 for in-use flag
+        data_view[:self.flag_bytes] = (value).to_bytes(self.flag_bytes,
+                                                       "little",
+                                                       signed=True)
 
     def put(self, key: str, value: Any) -> tuple[int, int]:
         """
@@ -424,13 +489,11 @@ class SingleWriterShmObjectStorage:
         if key in self.key_index:
             address, monotonic_id = self.key_index[key]
             with self.ring_buffer.access_buf(address) as (data_view, metadata):
-                # >0 for in-use flag
-                data_view[:self.flag_bytes] = (self.n_readers).to_bytes(
-                    self.flag_bytes, "little", signed=True)
+                self.set_reader_flag(data_view, self.n_readers)
             return address, monotonic_id
 
         object_data, data_bytes, object_metadata, md_bytes = \
-            self.calcsize_serialize(value)
+            self.ser_de.serialize(value)
         buffer_size = self.flag_bytes + data_bytes + md_bytes
 
         # Sanity checks
@@ -456,9 +519,7 @@ class SingleWriterShmObjectStorage:
 
         # Write data to buffer
         with self.ring_buffer.access_buf(address) as (data_view, metadata):
-            # >0 for in-use flag
-            data_view[:self.flag_bytes] = (self.n_readers).to_bytes(
-                self.flag_bytes, "little", signed=True)
+            self.set_reader_flag(data_view, self.n_readers)
             self.copy_to_buffer(object_data, data_bytes, object_metadata,
                                 md_bytes, data_view)
 
@@ -476,33 +537,7 @@ class SingleWriterShmObjectStorage:
                     f"Data for address:id '{address}:{monotonic_id}'"
                     " has been modified or is invalid.")
 
-            # pickle.loads do not read past the end of a pickled object
-            # within a large buffer
-            type_name, nbytes, len_arr = pickle.loads(
-                data_view[self.flag_bytes:])
-            serialized_data = bytearray(data_view[-nbytes:])
-
-            if type_name == torch.Tensor.__name__:
-                obj = []
-                start_idx = 0
-                for length in len_arr:
-                    item_bytes = serialized_data[start_idx:start_idx + length]
-                    obj.append(item_bytes)
-                    start_idx += length
-                obj = self.tensor_decoder.decode(obj)
-            elif type_name == MultiModalKwargs.__name__:
-                obj = []
-                start_idx = 0
-                for length in len_arr:
-                    item_bytes = serialized_data[start_idx:start_idx + length]
-                    obj.append(item_bytes)
-                    start_idx += length
-                obj = self.mm_decoder.decode(obj)
-            elif type_name == bytes.__name__:
-                obj = pickle.loads(serialized_data)
-            else:
-                raise ValueError(
-                    f"Unsupported object type '{type_name}' in metadata")
+            obj = self.ser_de.deserialize(data_view[self.flag_bytes:])
 
             # decrease the in-use flag for reader reads
             if self._reader_lock is not None:
@@ -511,8 +546,11 @@ class SingleWriterShmObjectStorage:
                                                   "little",
                                                   signed=True)
                     reader_count -= 1
-                    data_view[:self.flag_bytes] = reader_count.to_bytes(
-                        self.flag_bytes, "little", signed=True)
+                    self.set_reader_flag(data_view, reader_count)
+            else:
+                # if self._reader_lock is None, it means we are the writer
+                # in this case, we do not need to decrease the reader count
+                assert self.is_writer
 
         return obj
 
@@ -522,25 +560,9 @@ class SingleWriterShmObjectStorage:
             max_object_size=self.max_object_size,
             n_readers=self.n_readers,
             ring_buffer_handle=self.ring_buffer.handle(),
+            serde_class=self.serde_class,
             reader_lock=self._reader_lock,
         )
-
-    def get_and_update_mm_cache(
-        self,
-        args: tuple,
-    ) -> None:
-        """Check if the first argument is a SchedulerOutput and update
-        MultiModalKwargs from the object storage if needed."""
-        if args and isinstance(args[0], SchedulerOutput):
-            scheduler_output = args[0]
-            for request_data in scheduler_output.scheduled_new_reqs:
-                for i in range(len(request_data.mm_inputs)):
-                    mm_input = request_data.mm_inputs[i]
-                    if "address" in mm_input:
-                        address, monotonic_id = \
-                            mm_input["address"], mm_input["monotonic_id"]
-                        request_data.mm_inputs[i] = \
-                            self.get(address, monotonic_id)
 
     @staticmethod
     def is_enabled(mm_config: Optional[MultiModalConfig] = None) -> bool:
@@ -553,21 +575,13 @@ class SingleWriterShmObjectStorage:
     @staticmethod
     def create_from_handle(
             handle: ShmObjectStorageHandle) -> "SingleWriterShmObjectStorage":
-        """
-        Create a new SingleWriterShmObjectStorage from a handle.
-
-        Args:
-            handle: ShmObjectStorageHandle containing the necessary parameters
-
-        Returns:
-            A new SingleWriterShmObjectStorage instance
-        """
-        logger.info("Creating storage from handle: %s", handle)
+        logger.debug("Creating storage from handle: %s", handle)
         ring_buffer = SingleWriterShmRingBuffer(*handle.ring_buffer_handle)
         return SingleWriterShmObjectStorage(
             max_object_size=handle.max_object_size,
             n_readers=handle.n_readers,
             ring_buffer=ring_buffer,
+            serde_class=handle.serde_class,
             reader_lock=handle.reader_lock,
         )
 

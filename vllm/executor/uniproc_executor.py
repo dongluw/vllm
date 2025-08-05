@@ -10,8 +10,9 @@ import torch.distributed as dist
 
 import vllm.envs as envs
 from vllm.distributed.device_communicators.shm_object_storage import (
-    SingleWriterShmObjectStorage, SingleWriterShmRingBuffer)
+    MsgpackSerde, SingleWriterShmObjectStorage, SingleWriterShmRingBuffer)
 from vllm.executor.executor_base import ExecutorBase
+from vllm.executor.mm_utils import get_and_update_mm_cache
 from vllm.logger import init_logger
 from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
                         run_method)
@@ -64,6 +65,7 @@ class UniProcExecutor(ExecutorBase):
                 1024 * 1024,
                 n_readers=1,
                 ring_buffer=ring_buffer,
+                ser_de=MsgpackSerde,
                 reader_lock=Lock(),
             )
 
@@ -75,7 +77,7 @@ class UniProcExecutor(ExecutorBase):
         if kwargs is None:
             kwargs = {}
         if hasattr(self, 'object_storage'):
-            self.object_storage.get_and_update_mm_cache(args)
+            get_and_update_mm_cache(self.object_storage, args)
         answer = run_method(self.driver_worker, method, args, kwargs)
         return [answer]
 

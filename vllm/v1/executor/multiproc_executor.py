@@ -26,10 +26,11 @@ from vllm.distributed import (destroy_distributed_environment,
                               destroy_model_parallel)
 from vllm.distributed.device_communicators.shm_broadcast import (Handle,
                                                                  MessageQueue)
-from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.device_communicators.shm_object_storage import (
-    ShmObjectStorageHandle, SingleWriterShmObjectStorage,
+    MsgpackSerde, ShmObjectStorageHandle, SingleWriterShmObjectStorage,
     SingleWriterShmRingBuffer)
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.executor.mm_utils import get_and_update_mm_cache
 from vllm.executor.multiproc_worker_utils import (
     set_multiprocessing_worker_envs)
 from vllm.logger import init_logger
@@ -95,6 +96,7 @@ class MultiprocExecutor(Executor):
                 1024 * 1024,
                 n_readers=self.world_size,
                 ring_buffer_handle=ring_buffer.handle(),
+                serde_class=MsgpackSerde,
                 reader_lock=Lock(),
             )
         else:
@@ -615,7 +617,7 @@ class WorkerProc:
         while True:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue()
             if hasattr(self, 'object_storage'):
-                self.object_storage.get_and_update_mm_cache(args)
+                get_and_update_mm_cache(self.object_storage, args)
 
             try:
                 if isinstance(method, str):

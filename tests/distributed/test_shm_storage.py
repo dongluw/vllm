@@ -9,7 +9,7 @@ from multiprocessing import Lock
 
 # Assuming these are imported from your module
 from vllm.distributed.device_communicators.shm_object_storage import (
-    SingleWriterShmObjectStorage, SingleWriterShmRingBuffer)
+    MsgpackSerde, SingleWriterShmObjectStorage, SingleWriterShmRingBuffer)
 
 
 class TestSingleWriterShmObjectStorage(unittest.TestCase):
@@ -25,6 +25,7 @@ class TestSingleWriterShmObjectStorage(unittest.TestCase):
             max_object_size=1024 * 10,  # 10KB max object
             n_readers=2,
             ring_buffer=ring_buffer,
+            serde_class=MsgpackSerde,
             reader_lock=Lock(),
         )
 
@@ -262,6 +263,7 @@ def run_multiprocess_example():
             max_object_size=1024,
             n_readers=3,
             ring_buffer=ring_buffer,
+            serde_class=MsgpackSerde,
             reader_lock=Lock(),
         )
 
