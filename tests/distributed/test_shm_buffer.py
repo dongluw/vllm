@@ -86,10 +86,9 @@ class TestSingleWriterShmRingBuffer(unittest.TestCase):
                 data_buf[0:4] = (0).to_bytes(4, "little")  # 0 for not in-use
                 data_buf[4:len(test_data) + 4] = test_data
             print(self.ring_buffer.metadata)
-            freed_id_start, freed_id_end = (self.ring_buffer.free_buf()
-                                            )  # Reset buffer state
-            print(f"  Freed IDs: {freed_id_start} to {freed_id_end}")
-            self.assertEqual(freed_id_start, i)
+            freed_ids = self.ring_buffer.free_buf(lambda *args: True)
+            print(f"  Freed IDs: {freed_ids}")
+            self.assertEqual(freed_ids[0], i)
 
     def test_clear_buffer(self):
         """Test clearing the buffer"""
@@ -137,7 +136,7 @@ def main():
         for i in range(3):
             size = 100 + i * 50
             try:
-                freed_id_start, freed_id_end = writer_buffer.free_buf()
+                writer_buffer.free_buf(lambda *args: True)
                 address, monotonic_id = writer_buffer.allocate_buf(size)
                 address_array.append((address, size, monotonic_id))
 

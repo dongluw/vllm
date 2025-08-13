@@ -19,7 +19,6 @@ class TestSingleWriterShmObjectStorage(unittest.TestCase):
         ring_buffer = SingleWriterShmRingBuffer(
             data_buffer_size=1024 * 100,
             create=True,  # 10 MB buffer
-            is_free_fn=SingleWriterShmObjectStorage.default_is_free_check,
         )
         self.storage = SingleWriterShmObjectStorage(
             max_object_size=1024 * 10,  # 10KB max object
@@ -121,17 +120,11 @@ class TestSingleWriterShmObjectStorage(unittest.TestCase):
         retrieved1 = self.storage.get(address1, id1)
         self.assertEqual(retrieved1, value1)
 
-        # Second put with same key but different value
-        address2, id2 = self.storage.put(key, value2)
+        # should raise an error on second put
+        with self.assertRaises(ValueError) as context:
+            self.storage.put(key, value2)
 
-        # Should return same address and ID (cache hit)
-        self.assertEqual(address1, address2)
-        self.assertEqual(id1, id2)
-
-        retrieved2 = self.storage.get(address2, id2)
-        # data will not be overwritten for the same key,
-        # should still be the first value
-        self.assertEqual(retrieved2, value1)
+        self.assertIn("already exists in the storage", str(context.exception))
 
     def test_large_object_rejection(self):
         """Test that objects exceeding max_object_size are rejected."""
@@ -257,7 +250,6 @@ def run_multiprocess_example():
         ring_buffer = SingleWriterShmRingBuffer(
             data_buffer_size=1024 * 100,
             create=True,  # 10 MB buffer
-            is_free_fn=SingleWriterShmObjectStorage.default_is_free_check,
         )
         storage = SingleWriterShmObjectStorage(
             max_object_size=1024,

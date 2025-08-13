@@ -148,7 +148,6 @@ class ShmObjectCache(BaseObjectCache):
             1024,
             name=VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME,
             create=is_writer,
-            is_free_fn=SingleWriterShmObjectStorage.default_is_free_check,
         )
         self.mm_cache = SingleWriterShmObjectStorage(
             max_object_size=VLLM_OBJECT_STORAGE_MAX_OBJECT_SIZE_MB * 1024 *
@@ -167,7 +166,11 @@ class ShmObjectCache(BaseObjectCache):
         full_mm_inputs = list[Optional[MultiModalKwargs]]()
         for mm_input, mm_hash in zip(mm_inputs, mm_hashes):
             try:
-                address, monotonic_id = self.mm_cache.put(mm_hash, mm_input)
+                address, monotonic_id = self.mm_cache.get_cached(mm_hash)
+                # put mm_input in cache if not found
+                if address is None:
+                    address, monotonic_id = self.mm_cache.put(
+                        mm_hash, mm_input)
                 mm_input = {
                     "address": address,
                     "monotonic_id": monotonic_id,

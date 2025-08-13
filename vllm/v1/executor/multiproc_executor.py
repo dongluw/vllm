@@ -89,7 +89,6 @@ class MultiprocExecutor(Executor):
                 data_buffer_size=envs.VLLM_OBJECT_STORAGE_SHM_BUFFER_SIZE_MB *
                 1024 * 1024,
                 name=envs.VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME,
-                is_free_fn=SingleWriterShmObjectStorage.default_is_free_check,
             )
             object_storage_handle = ShmObjectStorageHandle(
                 max_object_size=envs.VLLM_OBJECT_STORAGE_MAX_OBJECT_SIZE_MB *
