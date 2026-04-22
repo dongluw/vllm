@@ -169,7 +169,7 @@ def run_evaluation(
         ("openai/whisper-large-v3", 12.744980),
         # TODO (ekagra): turn on after asr release
         # CohereASR is used to test the variable encoder length code paths
-        # ("CohereLabs/cohere-transcribe-03-2026", 11.92),
+        ("CohereLabs/cohere-transcribe-03-2026", 11.92),
     ],
 )
 # Original dataset is 20GB+ in size, hence we use a pre-filtered slice.
